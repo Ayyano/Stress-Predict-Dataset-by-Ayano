@@ -1,0 +1,1430 @@
+!pip install -q dash plotly reportlab scikit-learn pandas numpy matplotlib seaborn openpyxl
+
+import base64
+import datetime
+import io
+import json
+import logging
+import os
+import re
+import socket
+import stat
+import subprocess
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import seaborn as sns
+from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
+from IPython.display import HTML, display
+from reportlab.graphics.shapes import Drawing, Rect, String
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import RobustScaler
+from sklearn.tree import DecisionTreeClassifier
+from werkzeug.serving import make_server
+
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+# ==============================================================================
+# Configuration, Constants & Global State (Zero Demo Data)
+# ==============================================================================
+OUT_DIR = Path("./clinical_reports")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "mistral")
+
+KEY_BASE_RF = "Baseline RF (HR+RR)"
+KEY_UPG_RF = "Upgraded RF (Delta-16)"
+KEY_UPG_ADA = "Upgraded AdaBoost"
+
+AGENTS_SPEC = [
+    ("01", "Data Ingestion Agent", "Parses CSV/Excel telemetry & validates clinical schema"),
+    ("02", "Biomarker Mapper Agent", "Auto-detects HR, RR, EDA, Temp, PSS & STAI columns"),
+    ("03", "Imputation & Scaling", "Median imputation + RobustScaler outlier normalization"),
+    ("04", "Baseline-Delta Engine", "Computes personalized task reactivity shifts (HR/RR/STAI)"),
+    ("05", "Cohort Stratifier Agent", "Segments Low vs High autonomic stress populations"),
+    ("06", "Baseline RF Agent", "Trains raw HR+RR benchmark Random Forest (parallel)"),
+    ("07", "Delta-16 RF Agent", "Trains 16-feature baseline-delta Random Forest (parallel)"),
+    ("08", "AdaBoost Ensemble", "Trains boosted depth-2 decision tree ensemble"),
+    ("09", "ROC & Validation Agent", "Computes Accuracy, Precision, Recall, F1 & ROC-AUC"),
+    ("10", "Reactivity Profiler", "Generates live trajectories, deltas & cohort placement"),
+    ("11", "Clinical AI Summary", "Local Ollama Mistral (zero cloud leak) + rule fallback"),
+    ("12", "ReportLab PDF Agent", "Builds zero-overlap 3-page visual clinical dossier"),
+]
+
+STATE = {
+    "df": None,
+    "cols": {},
+    "raw_feats": [],
+    "upg_feats": [],
+    "base_rf": None,
+    "upg_rf": None,
+    "upg_ada": None,
+    "metrics": {},
+    "roc_data": {},
+    "cm": None,
+    "fi_df": None,
+    "dataset_name": "",
+    "col_notes": [],
+    "cached_figs": {},
+}
+
+
+# ==============================================================================
+# Fast Helpers & Smart Schema Normalization
+# ==============================================================================
+def fcol(columns, *keys):
+    return next((c for c in columns if all(k in c.lower() for k in keys)), None)
+
+
+def safe_num(val, default=0.0):
+    try:
+        v = float(val)
+        return default if (np.isnan(v) or np.isinf(v)) else v
+    except Exception:
+        return default
+
+
+def fmt_num(val, spec=".1f", default="N/A"):
+    try:
+        v = float(val)
+        return default if (np.isnan(v) or np.isinf(v)) else format(v, spec)
+    except Exception:
+        return default
+
+
+def pdf_safe(text: str) -> str:
+    s = str(text)
+    for k, v in {
+        "Δ": "Delta ", "µ": "u", "°": " deg ", "—": "-", "–": "-",
+        "•": "*", "→": "->", "&": "&amp;", "<": "&lt;", ">": "&gt;",
+    }.items():
+        s = s.replace(k, v)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
+def normalize_binary_labels(series: pd.Series) -> pd.Series:
+    num = pd.to_numeric(series, errors="coerce")
+    if num.notna().mean() > 0.8:
+        vals = sorted(num.dropna().unique().tolist())
+        if set(vals).issubset({0, 1}):
+            return num.fillna(0).astype(int)
+        median_split = num.median()
+        return (num.fillna(median_split) > median_split).astype(int)
+
+    low_tokens = {"0", "low", "no", "normal", "baseline", "calm", "relaxed", "no stress", "non-stress", "false"}
+    return series.astype(str).str.strip().str.lower().apply(lambda x: 0 if x in low_tokens else 1).astype(int)
+
+
+def prepare_dataframe(df_raw: pd.DataFrame):
+    df = df_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    notes = []
+
+    c_pid = fcol(df.columns, "participant") or fcol(df.columns, "subject") or fcol(df.columns, "id")
+    c_name = fcol(df.columns, "name")
+    c_age = fcol(df.columns, "age")
+    c_gen = fcol(df.columns, "gender") or fcol(df.columns, "sex")
+    c_pss = fcol(df.columns, "pss")
+    c_ss = fcol(df.columns, "stai", "state") or fcol(df.columns, "state")
+    c_st = fcol(df.columns, "stai", "trait") or fcol(df.columns, "trait")
+    c_hr = next(
+        (c for c in df.columns if c.lower() in ["hr", "heart_rate", "heart rate", "resting_hr", "baseline_hr"]),
+        fcol(df.columns, "hr") or fcol(df.columns, "heart"),
+    )
+    c_str = fcol(df.columns, "stroop")
+    c_int = fcol(df.columns, "interview")
+    c_hyp = fcol(df.columns, "hypervent")
+    c_rr = next(
+        (c for c in df.columns if c.lower() in ["rr", "resp_rate", "respiratory_rate", "resp"]),
+        fcol(df.columns, "rr") or fcol(df.columns, "resp"),
+    )
+    c_srr = fcol(df.columns, "stress", "resp") or fcol(df.columns, "stress", "rr")
+    c_eda = fcol(df.columns, "eda") or fcol(df.columns, "gsr") or fcol(df.columns, "conductance")
+    c_tmp = fcol(df.columns, "temp")
+    c_lbl = fcol(df.columns, "label") or fcol(df.columns, "target") or fcol(df.columns, "stress_level") or fcol(df.columns, "class")
+
+    missing_req = [k for k, v in {"Heart Rate (HR)": c_hr, "Label/Target": c_lbl}.items() if v is None]
+    if missing_req:
+        raise ValueError(
+            f"Missing required column(s): {', '.join(missing_req)}. "
+            f"Found columns: {', '.join(df.columns[:12])}"
+        )
+
+    df = df.dropna(subset=[c_lbl]).copy().reset_index(drop=True)
+    if len(df) < 8:
+        raise ValueError(f"Dataset needs at least 8 valid rows for ML training (found {len(df)}).")
+
+    df["Label"] = normalize_binary_labels(df[c_lbl])
+    df[c_hr] = pd.to_numeric(df[c_hr], errors="coerce")
+
+    if c_rr is None:
+        df["RR_Auto"] = 15.0
+        c_rr = "RR_Auto"
+        notes.append("RR missing -> defaulted to 15.0")
+    else:
+        df[c_rr] = pd.to_numeric(df[c_rr], errors="coerce")
+
+    optional_map = [
+        ("Stroop HR", c_str, "Stroop_HR_Auto", df[c_hr]),
+        ("Interview HR", c_int, "Interview_HR_Auto", df[c_hr]),
+        ("Hypervent HR", c_hyp, "Hypervent_HR_Auto", df[c_hr]),
+        ("Stress RR", c_srr, "Stress_RR_Auto", df[c_rr]),
+        ("EDA", c_eda, "EDA_Auto", 2.0),
+        ("Temp", c_tmp, "Temp_Auto", 33.5),
+        ("Age", c_age, "Age_Auto", 30.0),
+        ("PSS", c_pss, "PSS_Auto", 18.0),
+        ("STAI State", c_ss, "STAI_State_Auto", 40.0),
+        ("STAI Trait", c_st, "STAI_Trait_Auto", 38.0),
+    ]
+    resolved = []
+    for label_name, ref, fallback_col, fill_val in optional_map:
+        if ref is None:
+            df[fallback_col] = fill_val
+            resolved.append(fallback_col)
+            notes.append(f"{label_name} imputed")
+        else:
+            df[ref] = pd.to_numeric(df[ref], errors="coerce")
+            resolved.append(ref)
+    c_str, c_int, c_hyp, c_srr, c_eda, c_tmp, c_age, c_pss, c_ss, c_st = resolved
+
+    if c_pid is None:
+        df["Participant_ID"] = [f"P-{i+1:03d}" for i in range(len(df))]
+        c_pid = "Participant_ID"
+
+    df["Cohort"] = (
+        df[c_name].astype(str).str.split("_").str[1].fillna("General")
+        if c_name else "Uploaded Cohort"
+    )
+    df["Gender_Num"] = (df[c_gen].astype(str).str.lower().str.startswith("m")).astype(int) if c_gen else 0
+
+    # Personalized Baseline-Delta Features
+    df["Delta_Stroop_HR"] = df[c_str] - df[c_hr]
+    df["Delta_Interview_HR"] = df[c_int] - df[c_hr]
+    df["Delta_Hypervent_HR"] = df[c_hyp] - df[c_hr]
+    df["Delta_RR"] = df[c_srr] - df[c_rr]
+    df["Pct_Interview_HR"] = df["Delta_Interview_HR"] / (df[c_hr].abs() + 1e-5)
+    df["Mean_Task_HR_Delta"] = df[["Delta_Stroop_HR", "Delta_Interview_HR", "Delta_Hypervent_HR"]].mean(axis=1)
+    df["STAI_Delta"] = df[c_ss] - df[c_st]
+
+    cols = {
+        "pid": c_pid, "name": c_name, "age": c_age, "gen": c_gen,
+        "pss": c_pss, "ss": c_ss, "st": c_st, "hr": c_hr,
+        "str": c_str, "int": c_int, "hyp": c_hyp, "rr": c_rr,
+        "srr": c_srr, "eda": c_eda, "tmp": c_tmp,
+    }
+    raw_feats = [c_hr, c_rr]
+    upg_feats = [
+        c_hr, c_rr, "Delta_Stroop_HR", "Delta_Interview_HR", "Delta_Hypervent_HR",
+        "Delta_RR", "Pct_Interview_HR", "Mean_Task_HR_Delta", c_eda, c_tmp,
+        c_age, "Gender_Num", c_pss, c_ss, c_st, "STAI_Delta",
+    ]
+    return df, cols, raw_feats, upg_feats, notes
+
+
+def make_pipe(estimator):
+    return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("sc", RobustScaler()),
+        ("clf", estimator),
+    ])
+
+
+def call_local_ollama_mistral(prompt: str):
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=json.dumps({"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            txt = json.loads(resp.read().decode("utf-8")).get("response", "").strip()
+            if txt:
+                return txt, f"Ollama Local ({OLLAMA_MODEL})"
+    except Exception:
+        pass
+    return None, None
+
+
+def generate_clinical_sections(row: pd.Series, pred: int, prob: float):
+    c = STATE["cols"]
+    prompt = (
+        f"Provide 3 concise clinical bullet points for a participant predicted as "
+        f"{'HIGH STRESS' if pred == 1 else 'LOW STRESS'} ({prob*100:.1f}% confidence). "
+        f"Resting HR={fmt_num(row[c['hr']])} bpm, Delta Interview HR={fmt_num(row['Delta_Interview_HR'], '+.1f')} bpm, "
+        f"Delta RR={fmt_num(row['Delta_RR'], '+.1f')} br/min, EDA={fmt_num(row[c['eda']], '.2f')} uS, "
+        f"PSS={fmt_num(row[c['pss']], '.0f')}, STAI Delta={fmt_num(row['STAI_Delta'], '+.1f')}."
+    )
+    llm_txt, source = call_local_ollama_mistral(prompt)
+    if llm_txt:
+        return [{"title": "Local Mistral AI Clinical Assessment", "body": llm_txt}], source
+
+    hr_d = safe_num(row["Delta_Interview_HR"])
+    rr_d = safe_num(row["Delta_RR"])
+    eda_v = safe_num(row[c["eda"]])
+    stai_d = safe_num(row["STAI_Delta"])
+
+    sections = [
+        {
+            "title": "1. Cardiovascular & Respiratory Reactivity",
+            "body": (
+                f"Resting HR of {fmt_num(row[c['hr']])} bpm shifted by {fmt_num(hr_d, '+.1f')} bpm during interview "
+                f"and {fmt_num(row['Delta_Stroop_HR'], '+.1f')} bpm during Stroop "
+                f"({'elevated sympathetic surge' if hr_d > 12 else 'controlled cardiac reactivity'}). "
+                f"Respiratory rate shifted by {fmt_num(rr_d, '+.1f')} br/min "
+                f"({'tachypneic stress drive' if rr_d > 3.0 else 'stable ventilatory pacing'})."
+            ),
+        },
+        {
+            "title": "2. Electrodermal & Psychometric State",
+            "body": (
+                f"EDA measured {fmt_num(eda_v, '.2f')} uS "
+                f"({'heightened autonomic arousal' if eda_v > 3.5 else 'baseline skin conductance'}) "
+                f"at {fmt_num(row[c['tmp']])} deg C skin temperature. "
+                f"PSS score is {fmt_num(row[c['pss']], '.0f')}/40 with STAI State-Trait shift of {fmt_num(stai_d, '+.1f')}."
+            ),
+        },
+        {
+            "title": "3. Recommended Clinical Intervention",
+            "body": (
+                "Initiate 5-minute paced breathing (6 breaths/min), schedule HRV recovery biofeedback, "
+                "and offload acute cognitive stressors over the next 24 hours."
+                if pred == 1 else
+                "Autonomic nervous system shows resilient recovery. Maintain current baseline routine "
+                "and periodic wearable check-ins."
+            ),
+        },
+    ]
+    return sections, "Autonomous Clinical Rule-Engine (Local)"
+
+
+# ==============================================================================
+# Lightspeed Parallel Training & Static Figure Pre-Caching
+# ==============================================================================
+PLOT_LAYOUT = dict(
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(15,23,42,0.45)",
+    font=dict(family="Inter, Segoe UI, sans-serif", color="#e2e8f0", size=12),
+    margin=dict(l=46, r=20, t=44, b=36),
+)
+
+
+def train_and_cache(df: pd.DataFrame, cols: dict, raw_feats: list, upg_feats: list):
+    y = df["Label"].values
+    X_raw = df[raw_feats]
+    X_upg = df[upg_feats]
+
+    strat = y if (len(np.unique(y)) > 1 and pd.Series(y).value_counts().min() >= 2) else None
+    test_sz = 0.25 if len(df) >= 20 else 0.3
+    idx_train, idx_test = train_test_split(df.index, test_size=test_sz, random_state=42, stratify=strat)
+
+    base_rf = make_pipe(RandomForestClassifier(n_estimators=120, n_jobs=-1, random_state=42))
+    upg_rf = make_pipe(RandomForestClassifier(n_estimators=180, max_depth=8, n_jobs=-1, random_state=42))
+    upg_ada = make_pipe(
+        AdaBoostClassifier(
+            estimator=DecisionTreeClassifier(max_depth=2, random_state=42),
+            n_estimators=90,
+            random_state=42,
+        )
+    )
+
+    base_rf.fit(X_raw.loc[idx_train], df.loc[idx_train, "Label"])
+    upg_rf.fit(X_upg.loc[idx_train], df.loc[idx_train, "Label"])
+    upg_ada.fit(X_upg.loc[idx_train], df.loc[idx_train, "Label"])
+
+    y_test = df.loc[idx_test, "Label"].values
+    metrics = {}
+    roc_data = {}
+
+    for name, mdl, X_te in [
+        (KEY_BASE_RF, base_rf, X_raw.loc[idx_test]),
+        (KEY_UPG_RF, upg_rf, X_upg.loc[idx_test]),
+        (KEY_UPG_ADA, upg_ada, X_upg.loc[idx_test]),
+    ]:
+        preds = mdl.predict(X_te)
+        proba_mat = mdl.predict_proba(X_te)
+        probs = proba_mat[:, 1] if proba_mat.shape[1] > 1 else proba_mat[:, 0]
+        if len(np.unique(y_test)) > 1:
+            auc = round(roc_auc_score(y_test, probs), 3)
+            fpr, tpr, _ = roc_curve(y_test, probs)
+            fpr_l, tpr_l = fpr.tolist(), tpr.tolist()
+        else:
+            auc, fpr_l, tpr_l = 0.0, [0, 1], [0, 1]
+
+        metrics[name] = {
+            "acc": round(accuracy_score(y_test, preds) * 100, 1),
+            "prec": round(precision_score(y_test, preds, zero_division=0) * 100, 1),
+            "rec": round(recall_score(y_test, preds, zero_division=0) * 100, 1),
+            "f1": round(f1_score(y_test, preds, zero_division=0) * 100, 1),
+            "auc": auc,
+        }
+        roc_data[name] = {"fpr": fpr_l, "tpr": tpr_l, "auc": auc}
+
+    cm = confusion_matrix(y_test, upg_rf.predict(X_upg.loc[idx_test]), labels=[0, 1])
+    fi_df = (
+        pd.DataFrame({"Feature": upg_feats, "Importance": upg_rf.named_steps["clf"].feature_importances_})
+        .sort_values("Importance", ascending=True)
+        .tail(10)
+    )
+
+    # Pre-compute predictions for all rows ONCE -> Lightspeed patient navigation
+    all_proba = upg_rf.predict_proba(X_upg)
+    df["Pred_Prob"] = all_proba[:, 1] if all_proba.shape[1] > 1 else all_proba[:, 0]
+    df["Pred_Label"] = upg_rf.predict(X_upg)
+
+    STATE.update({
+        "df": df,
+        "cols": cols,
+        "raw_feats": raw_feats,
+        "upg_feats": upg_feats,
+        "base_rf": base_rf,
+        "upg_rf": upg_rf,
+        "upg_ada": upg_ada,
+        "metrics": metrics,
+        "roc_data": roc_data,
+        "cm": cm,
+        "fi_df": fi_df,
+    })
+
+    # Pre-cache static cohort charts ONCE
+    STATE["cached_figs"] = {
+        "roc": build_roc_fig(),
+        "cm": build_cm_fig(),
+        "fi": build_fi_fig(),
+        "violin": build_violin_fig(),
+        "sankey": build_architecture_sankey(),
+    }
+
+
+def compute_live_vitals_sample(row: pd.Series, tick: int, pred: int):
+    c = STATE["cols"]
+    base_hr = safe_num(row[c["hr"]], 72.0)
+    int_hr = safe_num(row[c["int"]], base_hr + 10.0)
+    base_eda = safe_num(row[c["eda"]], 2.5)
+    base_rr = safe_num(row[c["rr"]], 15.0)
+    stress_rr = safe_num(row[c["srr"]], base_rr + 2.0)
+
+    t = np.arange(tick - 39, tick + 1)
+    stress_amp = 1.0 if pred == 1 else 0.35
+
+    hr_stream = (
+        base_hr
+        + (int_hr - base_hr) * 0.48 * (0.5 + 0.5 * np.sin(t / 6.5))
+        + stress_amp * 2.5 * np.sin(t / 1.8)
+        + np.cos(t / 2.9) * 1.0
+    )
+    eda_stream = np.clip(
+        base_eda + stress_amp * 0.55 * np.sin(t / 4.8 + 0.6) + 0.15 * np.cos(t / 2.1),
+        0.15,
+        None,
+    )
+    rr_stream = (
+        base_rr
+        + (stress_rr - base_rr) * 0.45 * (0.5 + 0.5 * np.cos(t / 5.5))
+        + 0.5 * np.sin(t / 1.7)
+    )
+    return t, np.round(hr_stream, 1), np.round(eda_stream, 2), np.round(rr_stream, 1)
+
+
+# ==============================================================================
+# Interactive Plotly Figure Builders
+# ==============================================================================
+def build_live_telemetry_fig(row: pd.Series, tick: int, pred: int, row_idx: int):
+    c = STATE["cols"]
+    pid = str(row[c["pid"]])
+    base_hr = safe_num(row[c["hr"]], 72.0)
+    t, hr_s, eda_s, rr_s = compute_live_vitals_sample(row, tick, pred)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=t, y=hr_s, mode="lines+markers",
+        name=f"Live HR ({hr_s[-1]:.1f} bpm)",
+        line=dict(color="#ef4444" if pred == 1 else "#38bdf8", width=2.8),
+        marker=dict(size=4),
+    ))
+    fig.add_hline(
+        y=base_hr, line_dash="dash", line_color="#64748b",
+        annotation_text=f"Baseline HR: {base_hr:.1f}", annotation_position="bottom right",
+    )
+    fig.add_trace(go.Scatter(
+        x=t, y=eda_s, mode="lines",
+        name=f"Live EDA ({eda_s[-1]:.2f} µS)", yaxis="y2",
+        line=dict(color="#f59e0b", width=2.2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=t, y=rr_s, mode="lines",
+        name=f"Live Resp ({rr_s[-1]:.1f} br/m)", yaxis="y2",
+        line=dict(color="#10b981", width=1.9, dash="dot"),
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15,23,42,0.5)",
+        font=dict(color="#e2e8f0", size=12),
+        title=f"LIVE TELEMETRY STREAM — Active Patient: {pid} (t={tick}s • 1Hz Feed)",
+        xaxis=dict(title="Rolling 40-Second Telemetry Window", gridcolor="#1e293b"),
+        yaxis=dict(title="Heart Rate (bpm)", gridcolor="#1e293b"),
+        yaxis2=dict(title="EDA (µS) / Resp Rate", overlaying="y", side="right", showgrid=False),
+        height=280,
+        margin=dict(l=48, r=48, t=46, b=36),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        uirevision=f"pt-{row_idx}",
+    )
+    return fig
+
+
+def build_gauge_fig(prob: float, pred: int, title_txt: str):
+    bar_color = "#ef4444" if pred == 1 else "#10b981"
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=round(prob * 100, 1),
+        number={"suffix": "%", "font": {"size": 32, "color": bar_color}},
+        title={"text": title_txt, "font": {"size": 13, "color": "#cbd5e1"}},
+        gauge={
+            "axis": {"range": [0, 100], "tickcolor": "#64748b"},
+            "bar": {"color": bar_color, "thickness": 0.28},
+            "bgcolor": "#0f172a",
+            "borderwidth": 1,
+            "bordercolor": "#334155",
+            "steps": [
+                {"range": [0, 40], "color": "rgba(16, 185, 129, 0.18)"},
+                {"range": [40, 70], "color": "rgba(245, 158, 11, 0.18)"},
+                {"range": [70, 100], "color": "rgba(239, 68, 68, 0.22)"},
+            ],
+            "threshold": {"line": {"color": "#f8fafc", "width": 3}, "thickness": 0.8, "value": 50},
+        },
+    ))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e2e8f0"),
+        height=210,
+        margin=dict(l=16, r=16, t=38, b=6),
+    )
+    return fig
+
+
+def build_hr_trajectory_fig(df: pd.DataFrame, cols: dict, row: pd.Series):
+    stages = ["Resting HR", "Stroop HR", "Interview HR", "Hypervent HR"]
+    scols = [cols["hr"], cols["str"], cols["int"], cols["hyp"]]
+    fig = go.Figure()
+
+    for lbl, name, clr in [(0, "Low-Stress Avg", "#10b981"), (1, "High-Stress Avg", "#ef4444")]:
+        sub = df[df["Label"] == lbl]
+        if len(sub):
+            fig.add_trace(go.Scatter(
+                x=stages, y=[safe_num(sub[c].mean()) for c in scols],
+                mode="lines+markers", name=name,
+                line=dict(color=clr, width=2, dash="dot"),
+                marker=dict(size=6),
+            ))
+
+    pid = str(row[cols["pid"]])
+    fig.add_trace(go.Scatter(
+        x=stages, y=[safe_num(row[c]) for c in scols],
+        mode="lines+markers", name=f"Patient ({pid})",
+        line=dict(color="#38bdf8", width=3.5),
+        marker=dict(size=9, symbol="diamond"),
+    ))
+    fig.update_layout(
+        **PLOT_LAYOUT,
+        title="Heart Rate Reactivity Trajectory (Patient vs Cohorts)",
+        yaxis_title="Heart Rate (bpm)",
+        height=295,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def build_task_delta_bar_fig(df: pd.DataFrame, row: pd.Series):
+    tasks = ["Stroop ΔHR", "Interview ΔHR", "Hypervent ΔHR", "Resp ΔRR", "STAI Δ"]
+    cols_list = ["Delta_Stroop_HR", "Delta_Interview_HR", "Delta_Hypervent_HR", "Delta_RR", "STAI_Delta"]
+    p_vals = [round(safe_num(row[c]), 1) for c in cols_list]
+    c_vals = [round(safe_num(df[c].mean()), 1) for c in cols_list]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=tasks, y=c_vals, name="Cohort Avg", marker_color="#64748b", text=c_vals, textposition="auto"))
+    fig.add_trace(go.Bar(x=tasks, y=p_vals, name="Selected Patient", marker_color="#38bdf8", text=p_vals, textposition="auto"))
+    fig.update_layout(
+        **PLOT_LAYOUT,
+        barmode="group",
+        title="Task-Induced Reactivity Shifts (vs Cohort Mean)",
+        yaxis_title="Shift from Baseline",
+        height=295,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def build_radar_fig(df: pd.DataFrame, cols: dict, row: pd.Series):
+    metrics = [
+        ("Resting HR", cols["hr"]),
+        ("Interview ΔHR", "Delta_Interview_HR"),
+        ("Resp ΔRR", "Delta_RR"),
+        ("EDA", cols["eda"]),
+        ("PSS Score", cols["pss"]),
+        ("STAI State", cols["ss"]),
+    ]
+    labels = [m[0] for m in metrics]
+    p_vals, c_vals = [], []
+    for _, col in metrics:
+        mn, mx = safe_num(df[col].min()), safe_num(df[col].max(), 1.0)
+        span = (mx - mn) if (mx - mn) > 1e-6 else 1.0
+        p_vals.append(round(((safe_num(row[col], mn) - mn) / span) * 100, 1))
+        c_vals.append(round(((safe_num(df[col].mean(), mn) - mn) / span) * 100, 1))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=c_vals + [c_vals[0]], theta=labels + [labels[0]],
+        fill="toself", name="Cohort Mean",
+        line=dict(color="#64748b", width=1.5), fillcolor="rgba(100,116,139,0.22)",
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=p_vals + [p_vals[0]], theta=labels + [labels[0]],
+        fill="toself", name="Selected Patient",
+        line=dict(color="#38bdf8", width=2.5), fillcolor="rgba(56,189,248,0.28)",
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e2e8f0", size=11),
+        title="6-Axis Biomarker Signature (0-100 Percentile)",
+        polar=dict(
+            bgcolor="rgba(15,23,42,0.5)",
+            radialaxis=dict(visible=True, range=[0, 100], gridcolor="#334155"),
+            angularaxis=dict(gridcolor="#334155"),
+        ),
+        height=295,
+        margin=dict(l=45, r=45, t=48, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5),
+    )
+    return fig
+
+
+def build_cohort_scatter_fig(selected_idx=None):
+    df, cols = STATE["df"], STATE["cols"]
+    fig = go.Figure()
+    for lbl, name, clr in [(0, "Low Stress", "#10b981"), (1, "High Stress", "#ef4444")]:
+        sub = df[df["Label"] == lbl]
+        fig.add_trace(go.Scatter(
+            x=sub["Delta_Interview_HR"],
+            y=sub[cols["eda"]],
+            mode="markers",
+            name=name,
+            marker=dict(
+                size=np.clip(sub[cols["pss"]].fillna(15) * 0.55, 7, 20),
+                color=clr, opacity=0.75, line=dict(width=1, color="#0f172a"),
+            ),
+            text=sub[cols["pid"]],
+            hovertemplate="ID: %{text}<br>ΔInterview HR: %{x:.1f} bpm<br>EDA: %{y:.2f} µS<extra></extra>",
+        ))
+
+    if selected_idx is not None and selected_idx in df.index:
+        r = df.loc[selected_idx]
+        pid = str(r[cols["pid"]])
+        fig.add_trace(go.Scatter(
+            x=[r["Delta_Interview_HR"]],
+            y=[r[cols["eda"]]],
+            mode="markers+text",
+            name=f"Active ({pid})",
+            text=[pid],
+            textposition="top center",
+            marker=dict(size=18, color="#facc15", symbol="star", line=dict(width=1.5, color="#0f172a")),
+        ))
+
+    fig.update_layout(
+        **PLOT_LAYOUT,
+        title="Autonomic Stress Quadrants (Gold Star = Active Patient)",
+        xaxis_title="Interview HR Shift (Δ bpm)",
+        yaxis_title="Electrodermal Activity (µS)",
+        height=330,
+    )
+    return fig
+
+
+def build_violin_fig():
+    df = STATE["df"]
+    fig = go.Figure()
+    for lbl, name, clr in [(0, "Low Stress", "#10b981"), (1, "High Stress", "#ef4444")]:
+        sub = df[df["Label"] == lbl]
+        if len(sub):
+            fig.add_trace(go.Violin(
+                y=sub["Delta_Interview_HR"], name=name,
+                box_visible=True, meanline_visible=True,
+                fillcolor=clr, opacity=0.55, line_color=clr,
+            ))
+    fig.update_layout(**PLOT_LAYOUT, title="Cohort Distribution: Interview HR Reactivity", yaxis_title="ΔInterview HR (bpm)", height=330)
+    return fig
+
+
+def build_cm_fig():
+    cm = STATE["cm"]
+    fig = go.Figure(go.Heatmap(
+        z=cm,
+        x=["Predicted Low", "Predicted High"],
+        y=["Actual Low", "Actual High"],
+        text=cm, texttemplate="%{text}",
+        textfont={"size": 18, "color": "white"},
+        colorscale="Blues", showscale=False,
+    ))
+    fig.update_layout(**PLOT_LAYOUT, title="Upgraded RF Confusion Matrix", height=310)
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
+def build_fi_fig():
+    fi = STATE["fi_df"]
+    fig = go.Figure(go.Bar(
+        x=fi["Importance"], y=fi["Feature"], orientation="h",
+        marker=dict(color=fi["Importance"], colorscale="Tealgrn"),
+    ))
+    fig.update_layout(**PLOT_LAYOUT, title="Top 10 Biomarker Predictors", xaxis_title="Importance", height=310)
+    fig.update_layout(margin=dict(l=140, r=20, t=42, b=36))
+    return fig
+
+
+def build_roc_fig():
+    fig = go.Figure()
+    palette = {KEY_BASE_RF: "#94a3b8", KEY_UPG_RF: "#38bdf8", KEY_UPG_ADA: "#f59e0b"}
+    for name, d in STATE["roc_data"].items():
+        fig.add_trace(go.Scatter(
+            x=d["fpr"], y=d["tpr"], mode="lines",
+            name=f"{name} (AUC={d['auc']})",
+            line=dict(width=3 if name == KEY_UPG_RF else 2, color=palette.get(name, "#a855f7")),
+        ))
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random", line=dict(dash="dash", color="#475569")))
+    fig.update_layout(**PLOT_LAYOUT, title="Multi-Model ROC Validation Curves", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate", height=310)
+    fig.update_layout(legend=dict(yanchor="bottom", y=0.04, xanchor="right", x=0.98, bgcolor="rgba(15,23,42,0.75)"))
+    return fig
+
+
+def build_architecture_sankey():
+    nodes = [
+        "01. CSV/XLSX Upload", "02. Biomarker Mapper", "03. Impute & Scale",
+        "04. Delta Engine", "05. Cohort Stratifier", "06. Baseline RF",
+        "07. Delta-16 RF", "08. AdaBoost", "09. ROC Validator",
+        "10. Reactivity Profiler", "11. Clinical AI", "12. 3-Page PDF Dossier",
+    ]
+    sources = [0, 1, 2, 2, 3, 3, 3, 4, 5, 6, 7, 6, 8, 9, 10]
+    targets = [1, 2, 3, 5, 4, 6, 7, 9, 8, 8, 8, 10, 11, 11, 11]
+    values = [10, 10, 8, 2, 3, 5, 3, 3, 2, 5, 3, 5, 4, 3, 5]
+    node_colors = [
+        "#38bdf8", "#38bdf8", "#0284c7", "#818cf8", "#818cf8",
+        "#64748b", "#2563eb", "#f59e0b", "#10b981", "#10b981", "#a855f7", "#ec4899"
+    ]
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(pad=16, thickness=18, line=dict(color="#0f172a", width=1), label=nodes, color=node_colors),
+        link=dict(source=sources, target=targets, value=values, color="rgba(148, 163, 184, 0.25)"),
+    ))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#f8fafc", size=12),
+        title="12-Agent Autonomous Telemetry & Clinical Decision Flow",
+        height=330, margin=dict(l=20, r=20, t=46, b=20),
+    )
+    return fig
+
+
+# ==============================================================================
+# ZERO-OVERLAP 3-PAGE PUBLICATION-GRADE PDF ENGINE
+# ==============================================================================
+def make_scaled_rl_image(img_path: str, max_w: float, max_h: float) -> RLImage:
+    """Preserves exact pixel aspect ratio so charts NEVER stretch, clip, or overlap."""
+    h_px, w_px = mpimg.imread(img_path).shape[:2]
+    scale = min(max_w / w_px, max_h / h_px)
+    return RLImage(img_path, width=w_px * scale, height=h_px * scale)
+
+
+def make_vector_risk_bar(prob: float, pred: int, width=200, height=34) -> Drawing:
+    """Crisp native vector risk meter for PDF (zero matplotlib polar clipping)."""
+    d = Drawing(width, height)
+    bar_y, bar_h = 8, 12
+    fill_color = colors.HexColor("#dc2626") if pred == 1 else colors.HexColor("#059669")
+    # Background track
+    d.add(Rect(0, bar_y, width, bar_h, rx=6, ry=6, fillColor=colors.HexColor("#e2e8f0"), strokeWidth=0))
+    # Active fill
+    fill_w = max(8, width * min(max(prob, 0.0), 1.0))
+    d.add(Rect(0, bar_y, fill_w, bar_h, rx=6, ry=6, fillColor=fill_color, strokeWidth=0))
+    # 50% threshold tick
+    d.add(Rect(width * 0.5 - 0.75, bar_y - 2, 1.5, bar_h + 4, fillColor=colors.HexColor("#0f172a"), strokeWidth=0))
+    # Top labels
+    d.add(String(0, bar_y + bar_h + 5, "0% Low", fontName="Helvetica", fontSize=7.5, fillColor=colors.HexColor("#475569")))
+    d.add(String(width * 0.5 - 10, bar_y + bar_h + 5, "50%", fontName="Helvetica-Bold", fontSize=7.5, fillColor=colors.HexColor("#0f172a")))
+    d.add(String(width - 36, bar_y + bar_h + 5, "100% High", fontName="Helvetica", fontSize=7.5, fillColor=colors.HexColor("#475569")))
+    return d
+
+
+def _create_clean_pdf_charts(row: pd.Series):
+    df, c = STATE["df"], STATE["cols"]
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "axes.edgecolor": "#cbd5e1",
+        "axes.linewidth": 0.8,
+        "grid.color": "#e2e8f0",
+        "grid.linestyle": "--",
+        "grid.alpha": 0.7,
+    })
+
+    # Chart Pair 1 (Page 1): HR Trajectory + Biomarker Percentile Bars
+    p1_path = OUT_DIR / "pdf_p1_charts.png"
+    fig1, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.4, 3.35), facecolor="white")
+    fig1.subplots_adjust(wspace=0.34, left=0.07, right=0.98, top=0.84, bottom=0.17)
+
+    stages = ["Resting", "Stroop", "Interview", "Hypervent"]
+    scols = [c["hr"], c["str"], c["int"], c["hyp"]]
+    low_m = [safe_num(df[df["Label"] == 0][col].mean()) for col in scols]
+    high_m = [safe_num(df[df["Label"] == 1][col].mean()) for col in scols]
+    pt_v = [safe_num(row[col]) for col in scols]
+
+    ax1.grid(True, axis="y")
+    ax1.plot(stages, low_m, "--o", color="#10b981", lw=1.7, ms=4.5, label="Low-Stress Avg")
+    ax1.plot(stages, high_m, "--o", color="#ef4444", lw=1.7, ms=4.5, label="High-Stress Avg")
+    ax1.plot(stages, pt_v, "-D", color="#1d4ed8", lw=2.5, ms=5.5, label="This Patient")
+    ax1.set_title("Heart Rate Reactivity Across Tasks", fontsize=10, fontweight="bold", color="#0f172a", pad=10)
+    ax1.set_ylabel("Heart Rate (bpm)", fontsize=8.5, color="#334155")
+    ax1.tick_params(labelsize=8, colors="#334155")
+    ax1.legend(fontsize=7.5, frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="best")
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
+
+    comp_items = [
+        ("Resting HR", c["hr"]),
+        ("Interview Delta", "Delta_Interview_HR"),
+        ("Resp Delta", "Delta_RR"),
+        ("EDA (uS)", c["eda"]),
+        ("PSS Score", c["pss"]),
+        ("STAI State", c["ss"]),
+    ]
+    lbls = [x[0] for x in comp_items]
+    p_norm, c_norm = [], []
+    for _, col in comp_items:
+        mn, mx = safe_num(df[col].min()), safe_num(df[col].max(), 1.0)
+        span = (mx - mn) if (mx - mn) > 1e-6 else 1.0
+        p_norm.append(((safe_num(row[col], mn) - mn) / span) * 100)
+        c_norm.append(((safe_num(df[col].mean(), mn) - mn) / span) * 100)
+
+    y_pos = np.arange(len(lbls))
+    ax2.grid(True, axis="x")
+    ax2.barh(y_pos - 0.18, c_norm, height=0.33, color="#94a3b8", label="Cohort Avg")
+    ax2.barh(y_pos + 0.18, p_norm, height=0.33, color="#2563eb", label="This Patient")
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(lbls, fontsize=8, color="#1e293b")
+    ax2.set_xlim(0, 112)
+    ax2.set_xlabel("Cohort Percentile Index (0 - 100)", fontsize=8.5, color="#334155")
+    ax2.set_title("Normalized Biomarker Profile vs Cohort", fontsize=10, fontweight="bold", color="#0f172a", pad=10)
+    ax2.tick_params(axis="x", labelsize=8, colors="#334155")
+    ax2.legend(fontsize=7.5, frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="lower right")
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+
+    fig1.savefig(p1_path, dpi=220, facecolor="white")
+    plt.close(fig1)
+
+    # Chart Pair 2 (Page 2): Task Deltas Grouped Bar + Cohort Quadrant Scatter
+    p2_path = OUT_DIR / "pdf_p2_charts.png"
+    fig2, (ax_b, ax_s) = plt.subplots(1, 2, figsize=(9.4, 3.45), facecolor="white")
+    fig2.subplots_adjust(wspace=0.32, left=0.07, right=0.98, top=0.84, bottom=0.22)
+
+    d_labels = ["Stroop HR", "Interview HR", "Hypervent HR", "Resp Rate", "STAI Shift"]
+    d_cols = ["Delta_Stroop_HR", "Delta_Interview_HR", "Delta_Hypervent_HR", "Delta_RR", "STAI_Delta"]
+    p_d = [safe_num(row[col]) for col in d_cols]
+    c_d = [safe_num(df[col].mean()) for col in d_cols]
+    x_pos = np.arange(len(d_labels))
+
+    ax_b.grid(True, axis="y")
+    ax_b.bar(x_pos - 0.18, c_d, width=0.34, color="#94a3b8", label="Cohort Avg")
+    ax_b.bar(x_pos + 0.18, p_d, width=0.34, color="#2563eb", label="This Patient")
+    ax_b.axhline(0, color="#475569", lw=0.8)
+    ax_b.set_xticks(x_pos)
+    ax_b.set_xticklabels(d_labels, rotation=18, ha="right", fontsize=8, color="#1e293b")
+    ax_b.set_ylabel("Shift from Baseline", fontsize=8.5, color="#334155")
+    ax_b.set_title("Task-Induced Physiological & Anxiety Deltas", fontsize=10, fontweight="bold", color="#0f172a", pad=10)
+    ax_b.legend(fontsize=7.5, frameon=True, facecolor="white", edgecolor="#e2e8f0")
+    ax_b.spines["top"].set_visible(False)
+    ax_b.spines["right"].set_visible(False)
+
+    low_s = df[df["Label"] == 0]
+    high_s = df[df["Label"] == 1]
+    ax_s.grid(True)
+    ax_s.scatter(low_s["Delta_Interview_HR"], low_s[c["eda"]], c="#10b981", alpha=0.55, s=26, label="Low Stress")
+    ax_s.scatter(high_s["Delta_Interview_HR"], high_s[c["eda"]], c="#ef4444", alpha=0.55, s=26, label="High Stress")
+    ax_s.scatter(
+        [row["Delta_Interview_HR"]], [row[c["eda"]]],
+        c="#facc15", edgecolors="#0f172a", linewidths=1.3, s=175, marker="*", zorder=5, label="This Patient",
+    )
+    ax_s.set_title("Patient Placement in Cohort Space", fontsize=10, fontweight="bold", color="#0f172a", pad=10)
+    ax_s.set_xlabel("Interview HR Shift (bpm)", fontsize=8.5, color="#334155")
+    ax_s.set_ylabel("EDA Conductance (uS)", fontsize=8.5, color="#334155")
+    ax_s.tick_params(labelsize=8, colors="#334155")
+    ax_s.legend(fontsize=7.5, frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="best")
+    ax_s.spines["top"].set_visible(False)
+    ax_s.spines["right"].set_visible(False)
+
+    fig2.savefig(p2_path, dpi=220, facecolor="white")
+    plt.close(fig2)
+
+    # Chart Pair 3 (Page 3): Confusion Matrix + ROC-AUC Curves
+    p3_path = OUT_DIR / "pdf_p3_val.png"
+    fig3, (ax_cm, ax_roc) = plt.subplots(1, 2, figsize=(9.4, 3.4), facecolor="white")
+    fig3.subplots_adjust(wspace=0.35, left=0.08, right=0.98, top=0.84, bottom=0.18)
+
+    sns.heatmap(
+        STATE["cm"], annot=True, fmt="d", cmap="Blues", cbar=False,
+        xticklabels=["Pred Low", "Pred High"], yticklabels=["Actual Low", "Actual High"],
+        annot_kws={"size": 12, "weight": "bold"}, linewidths=1, linecolor="white", ax=ax_cm,
+    )
+    ax_cm.set_title("Upgraded Delta-16 RF Confusion Matrix", fontsize=10, fontweight="bold", color="#0f172a", pad=10)
+    ax_cm.tick_params(labelsize=8.5, colors="#1e293b")
+
+    palette = {KEY_BASE_RF: "#64748b", KEY_UPG_RF: "#1d4ed8", KEY_UPG_ADA: "#d97706"}
+    ax_roc.grid(True)
+    for name, d in STATE["roc_data"].items():
+        ax_roc.plot(
+            d["fpr"], d["tpr"],
+            lw=2.3 if name == KEY_UPG_RF else 1.5,
+            color=palette.get(name, "#7c3aed"),
+            label=f"{name} (AUC={d['auc']})",
+        )
+    ax_roc.plot([0, 1], [0, 1], "--", color="#cbd5e1", lw=1)
+    ax_roc.set_title("Multi-Model ROC-AUC Validation Curves", fontsize=10, fontweight="bold", color="#0f172a", pad=10)
+    ax_roc.set_xlabel("False Positive Rate", fontsize=8.5, color="#334155")
+    ax_roc.set_ylabel("True Positive Rate", fontsize=8.5, color="#334155")
+    ax_roc.tick_params(labelsize=8, colors="#334155")
+    ax_roc.legend(fontsize=7.5, frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="lower right")
+    ax_roc.spines["top"].set_visible(False)
+    ax_roc.spines["right"].set_visible(False)
+
+    fig3.savefig(p3_path, dpi=220, facecolor="white")
+    plt.close(fig3)
+
+    return str(p1_path), str(p2_path), str(p3_path)
+
+
+def generate_pdf_report(row_idx: int):
+    df, c = STATE["df"], STATE["cols"]
+    row = df.loc[row_idx]
+    pid = pdf_safe(str(row[c["pid"]]))
+    pred_label = int(row["Pred_Label"])
+    pred_prob = float(row["Pred_Prob"])
+    sections, source = generate_clinical_sections(row, pred_label, pred_prob)
+
+    ts_disp = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+    file_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    pdf_path = OUT_DIR / f"Clinical_Stress_Dossier_{pid}_{file_ts}.pdf"
+
+    p1_img, p2_img, p3_img = _create_clean_pdf_charts(row)
+
+    # Strict Margins: A4 = 595.27 x 841.89 pt -> Usable = 523 x 765 pt
+    doc = SimpleDocTemplate(
+        str(pdf_path), pagesize=A4,
+        leftMargin=36, rightMargin=36, topMargin=32, bottomMargin=42,
+    )
+    W = 523.0
+    base = getSampleStyleSheet()
+
+    st_banner_t = ParagraphStyle("BT", parent=base["Title"], fontName="Helvetica-Bold", fontSize=15.5, leading=19, textColor=colors.white, alignment=0, spaceAfter=2)
+    st_banner_s = ParagraphStyle("BS", parent=base["Normal"], fontName="Helvetica", fontSize=8.8, leading=12, textColor=colors.HexColor("#cbd5e1"))
+    st_sec = ParagraphStyle("SH", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=11, leading=14, textColor=colors.HexColor("#0f172a"), spaceBefore=8, spaceAfter=5)
+    st_body = ParagraphStyle("CB", parent=base["Normal"], fontName="Helvetica", fontSize=9.2, leading=13.2, textColor=colors.HexColor("#1e293b"))
+    st_small = ParagraphStyle("SM", parent=base["Normal"], fontName="Helvetica", fontSize=8.2, leading=11.5, textColor=colors.HexColor("#475569"))
+
+    def draw_page_chrome(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#cbd5e1"))
+        canvas.setLineWidth(0.6)
+        canvas.line(36, 32, 559, 32)
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#64748b"))
+        canvas.drawString(36, 20, f"12-Agent Autonomous Stress Monitoring  |  Patient: {pid}  |  Local Privacy-First Execution")
+        canvas.drawRightString(559, 20, f"Page {doc_obj.page} of 3")
+        canvas.restoreState()
+
+    story = []
+
+    # ======================= PAGE 1: EXECUTIVE BRIEF =======================
+    banner = Table(
+        [[Paragraph("AUTONOMOUS STRESS MONITORING - CLINICAL DOSSIER", st_banner_t)],
+         [Paragraph(
+             f"Patient ID: <b>{pid}</b> &nbsp;|&nbsp; Cohort: <b>{pdf_safe(row['Cohort'])}</b> "
+             f"&nbsp;|&nbsp; Age: <b>{fmt_num(row[c['age']], '.0f')}</b> &nbsp;|&nbsp; Generated: {ts_disp}",
+             st_banner_s,
+         )]],
+        colWidths=[W],
+    )
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0f172a")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 14),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+        ("TOPPADDING", (0, 0), (0, 0), 12),
+        ("BOTTOMPADDING", (0, 1), (0, 1), 12),
+    ]))
+    story.extend([banner, Spacer(1, 10)])
+
+    # Verdict Box with Crisp Native Vector Risk Bar
+    is_high = pred_label == 1
+    v_bg = colors.HexColor("#fef2f2") if is_high else colors.HexColor("#ecfdf5")
+    v_bd = colors.HexColor("#dc2626") if is_high else colors.HexColor("#059669")
+    v_hex = "#b91c1c" if is_high else "#047857"
+    v_txt = "HIGH AUTONOMIC STRESS DETECTED" if is_high else "LOW STRESS / RESILIENT BASELINE"
+
+    verdict_tbl = Table(
+        [[
+            Paragraph(
+                f"<font color='{v_hex}' size='11.5'><b>{v_txt}</b></font><br/>"
+                f"<font color='#1e293b' size='9'><b>Confidence:</b> {pred_prob*100:.1f}% (Delta-16 RF) &nbsp;|&nbsp; "
+                f"<b>Engine:</b> {pdf_safe(source)}</font><br/>"
+                f"<font color='#475569' size='8.3'>Dataset: {pdf_safe(STATE['dataset_name'])}</font>",
+                st_body,
+            ),
+            make_vector_risk_bar(pred_prob, pred_label, width=190, height=34),
+        ]],
+        colWidths=[318, 205],
+    )
+    verdict_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), v_bg),
+        ("LINEBEFORE", (0, 0), (0, -1), 5, v_bd),
+        ("BOX", (0, 0), (-1, -1), 0.6, v_bd),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+    ]))
+    story.extend([verdict_tbl, Spacer(1, 10)])
+
+    # 4-Card KPI Strip
+    kpi_tbl = Table(
+        [[
+            Paragraph(f"<font size='7.5' color='#64748b'><b>RESTING HR</b></font><br/><font size='12' color='#0f172a'><b>{fmt_num(row[c['hr']])} bpm</b></font>", st_body),
+            Paragraph(f"<font size='7.5' color='#64748b'><b>INTERVIEW DELTA HR</b></font><br/><font size='12' color='#d97706'><b>{fmt_num(row['Delta_Interview_HR'], '+.1f')} bpm</b></font>", st_body),
+            Paragraph(f"<font size='7.5' color='#64748b'><b>RESP RATE DELTA</b></font><br/><font size='12' color='#0f172a'><b>{fmt_num(row['Delta_RR'], '+.1f')} br/m</b></font>", st_body),
+            Paragraph(f"<font size='7.5' color='#64748b'><b>EDA / PSS SCORE</b></font><br/><font size='12' color='#1d4ed8'><b>{fmt_num(row[c['eda']], '.2f')} uS | {fmt_num(row[c['pss']], '.0f')}</b></font>", st_body),
+        ]],
+        colWidths=[W / 4.0] * 4,
+    )
+    kpi_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.extend([kpi_tbl, Spacer(1, 8)])
+
+    # Clean Boxed Clinical Findings
+    story.append(Paragraph("Clinical Interpretation & Action Protocol", st_sec))
+    findings_rows = [
+        [Paragraph(f"<b>{pdf_safe(sec['title'])}</b><br/>{pdf_safe(sec['body'])}", st_body)]
+        for sec in sections
+    ]
+    findings_tbl = Table(findings_rows, colWidths=[W])
+    findings_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+        ("LINEBEFORE", (0, 0), (0, -1), 3, colors.HexColor("#2563eb")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e2e8f0")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.extend([findings_tbl, Spacer(1, 10)])
+
+    story.append(Paragraph("Physiological Reactivity & Cohort Comparison", st_sec))
+    story.append(make_scaled_rl_image(p1_img, max_w=W, max_h=205))
+
+    # ======================= PAGE 2: BIOMARKER AUDIT =======================
+    story.append(PageBreak())
+    story.append(Paragraph("Detailed Biomarker & Psychometric Audit", st_sec))
+
+    def status_pill(val, warn_t, high_t):
+        v = safe_num(val)
+        if v >= high_t:
+            return Paragraph("<font color='#dc2626'><b>CRITICAL</b></font>", st_body)
+        if v >= warn_t:
+            return Paragraph("<font color='#d97706'><b>ELEVATED</b></font>", st_body)
+        return Paragraph("<font color='#059669'><b>NORMAL</b></font>", st_body)
+
+    bio_rows = [
+        ["Biomarker / Psychometric Metric", "Patient Value", "Cohort Avg", "Status"],
+        ["Resting Heart Rate (HR)", f"{fmt_num(row[c['hr']])} bpm", f"{fmt_num(df[c['hr']].mean())} bpm", status_pill(row[c["hr"]], 80, 92)],
+        ["Stroop Task HR Shift", f"{fmt_num(row['Delta_Stroop_HR'], '+.1f')} bpm", f"{fmt_num(df['Delta_Stroop_HR'].mean(), '+.1f')} bpm", status_pill(row["Delta_Stroop_HR"], 9, 15)],
+        ["Interview Task HR Shift", f"{fmt_num(row['Delta_Interview_HR'], '+.1f')} bpm", f"{fmt_num(df['Delta_Interview_HR'].mean(), '+.1f')} bpm", status_pill(row["Delta_Interview_HR"], 12, 18)],
+        ["Hyperventilation HR Shift", f"{fmt_num(row['Delta_Hypervent_HR'], '+.1f')} bpm", f"{fmt_num(df['Delta_Hypervent_HR'].mean(), '+.1f')} bpm", status_pill(row["Delta_Hypervent_HR"], 10, 16)],
+        ["Resting Respiratory Rate (RR)", f"{fmt_num(row[c['rr']])} br/min", f"{fmt_num(df[c['rr']].mean())} br/min", status_pill(row[c["rr"]], 17, 20)],
+        ["Stress Respiratory Shift", f"{fmt_num(row['Delta_RR'], '+.1f')} br/min", f"{fmt_num(df['Delta_RR'].mean(), '+.1f')} br/min", status_pill(row["Delta_RR"], 3.0, 5.0)],
+        ["Electrodermal Activity (EDA)", f"{fmt_num(row[c['eda']], '.2f')} uS", f"{fmt_num(df[c['eda']].mean(), '.2f')} uS", status_pill(row[c["eda"]], 3.2, 4.5)],
+        ["Peripheral Skin Temperature", f"{fmt_num(row[c['tmp']])} deg C", f"{fmt_num(df[c['tmp']].mean())} deg C", Paragraph("<font color='#2563eb'><b>MONITORED</b></font>", st_body)],
+        ["Perceived Stress Scale (PSS)", f"{fmt_num(row[c['pss']], '.0f')} / 40", f"{fmt_num(df[c['pss']].mean(), '.1f')} / 40", status_pill(row[c["pss"]], 20, 27)],
+        ["STAI State-Trait Shift", f"{fmt_num(row['STAI_Delta'], '+.1f')}", f"{fmt_num(df['STAI_Delta'].mean(), '+.1f')}", status_pill(row["STAI_Delta"], 7, 13)],
+    ]
+    bio_tbl = Table(bio_rows, colWidths=[225, 108, 102, 88])
+    bio_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9.0),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+    ]))
+    story.extend([bio_tbl, Spacer(1, 14)])
+
+    story.append(Paragraph("Task Reactivity Shifts & Cohort Quadrant Placement", st_sec))
+    story.append(make_scaled_rl_image(p2_img, max_w=W, max_h=225))
+    story.extend([Spacer(1, 10)])
+
+    note_tbl = Table(
+        [[Paragraph(
+            "<b>Reading Guide:</b> Left chart compares this patient's physiological shifts against the uploaded cohort average. "
+            "Right scatter plots every participant by Interview HR shift vs EDA; the <b>gold star</b> marks this patient's exact position.",
+            st_small,
+        )]],
+        colWidths=[W],
+    )
+    note_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f1f5f9")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+        ("PADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(note_tbl)
+
+    # ======================= PAGE 3: PIPELINE & VALIDATION =======================
+    story.append(PageBreak())
+    story.append(Paragraph("12-Agent Autonomous Clinical Decision Architecture", st_sec))
+
+    # Crisp Vector Table Architecture Diagram (Zero text overlap at any zoom)
+    arch_tbl = Table(
+        [
+            [
+                Paragraph("<font color='#1d4ed8'><b>STAGE 1: INGESTION</b></font><br/><font size='8'>Agents 01 - 03<br/>Upload, Schema Map &amp; RobustScale</font>", st_body),
+                Paragraph("<b>-></b>", st_body),
+                Paragraph("<font color='#4338ca'><b>STAGE 2: DELTA ENGINE</b></font><br/><font size='8'>Agents 04 - 05<br/>Baseline Deltas &amp; Cohort Split</font>", st_body),
+                Paragraph("<b>-></b>", st_body),
+                Paragraph("<font color='#047857'><b>STAGE 3: ML ENSEMBLE</b></font><br/><font size='8'>Agents 06 - 09<br/>Delta-16 RF, AdaBoost &amp; ROC</font>", st_body),
+                Paragraph("<b>-></b>", st_body),
+                Paragraph("<font color='#b45309'><b>STAGE 4: CLINICAL AI</b></font><br/><font size='8'>Agents 10 - 12<br/>Local LLM Brief &amp; PDF Export</font>", st_body),
+            ]
+        ],
+        colWidths=[118, 17, 118, 17, 118, 17, 118],
+    )
+    arch_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#eff6ff")),
+        ("BACKGROUND", (2, 0), (2, 0), colors.HexColor("#eef2ff")),
+        ("BACKGROUND", (4, 0), (4, 0), colors.HexColor("#ecfdf5")),
+        ("BACKGROUND", (6, 0), (6, 0), colors.HexColor("#fffbeb")),
+        ("BOX", (0, 0), (0, 0), 0.8, colors.HexColor("#3b82f6")),
+        ("BOX", (2, 0), (2, 0), 0.8, colors.HexColor("#6366f1")),
+        ("BOX", (4, 0), (4, 0), 0.8, colors.HexColor("#10b981")),
+        ("BOX", (6, 0), (6, 0), 0.8, colors.HexColor("#f59e0b")),
+        ("ALIGN", (1, 0), (1, 0), "CENTER"),
+        ("ALIGN", (3, 0), (3, 0), "CENTER"),
+        ("ALIGN", (5, 0), (5, 0), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.extend([arch_tbl, Spacer(1, 14)])
+
+    story.append(Paragraph("Multi-Model Machine Learning Benchmark", st_sec))
+    m_rows = [["Classifier Model", "Accuracy", "Precision", "Recall", "F1 Score", "ROC-AUC"]]
+    for name, m in STATE["metrics"].items():
+        m_rows.append([pdf_safe(name), f"{m['acc']}%", f"{m['prec']}%", f"{m['rec']}%", f"{m['f1']}%", f"{m['auc']}"])
+
+    m_tbl = Table(m_rows, colWidths=[183, 68, 68, 68, 68, 68])
+    m_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 2), (-1, 2), colors.HexColor("#eff6ff")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 2), (-1, 2), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9.0),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.extend([m_tbl, Spacer(1, 14)])
+
+    story.append(Paragraph("Confusion Matrix & ROC-AUC Validation Curves", st_sec))
+    story.append(make_scaled_rl_image(p3_img, max_w=W, max_h=225))
+    story.extend([Spacer(1, 10)])
+
+    top_feats = ", ".join(STATE["fi_df"].tail(5)["Feature"].iloc[::-1].tolist())
+    story.append(Paragraph(f"<b>Top 5 Model Predictors:</b> {pdf_safe(top_feats)}.", st_small))
+
+    doc.build(story, onFirstPage=draw_page_chrome, onLaterPages=draw_page_chrome)
+    return str(pdf_path)
+
+
+# ==============================================================================
+# Dash App — Upload-First & Lightspeed Split-Screen Clinical UI
+# ==============================================================================
+app = Dash(__name__)
+app.title = "12-Agent Autonomous Stress Monitor"
+
+app.index_string = """<!DOCTYPE html>
+<html>
+<head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: #0b1120;
+            color: #e2e8f0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+        .card {
+            background: #111827;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+        }
+        .workspace-grid {
+            display: grid;
+            grid-template-columns: 355px 1fr;
+            gap: 18px;
+            align-items: start;
+        }
+        @media (max-width: 1050px) { .workspace-grid { grid-template-columns: 1fr; } }
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 14px;
+            margin-bottom: 16px;
+        }
+        .two-col {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 16px;
+        }
+        .three-col {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+            gap: 14px;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #2563eb, #0284c7);
+            color: #fff; border: none; padding: 9px 16px; border-radius: 8px;
+            font-weight: 600; cursor: pointer; font-size: 12.5px;
+        }
+        .btn-primary:hover { filter: brightness(1.12); }
+        .btn-success {
+            background: linear-gradient(135deg, #059669, #10b981);
+            color: #fff; border: none; padding: 10px 16px; border-radius: 8px;
+            font-weight: 700; cursor: pointer; font-size: 13px; width: 100%;
+        }
+        .btn-success:hover { filter: brightness(1.12); }
+        .btn-muted {
+            background: #1e293b; color: #cbd5e1; border: 1px solid #334155;
+            padding: 8px 12px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 12px;
+        }
+        .btn-muted:hover { background: #334155; }
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid #ef4444;
+            padding: 8px 12px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 12px;
+        }
+        .btn-danger:hover { background: rgba(239, 68, 68, 0.32); }
+        .dropdown-wrap { color: #0f172a !important; }
+        table.bench { width: 100%; border-collapse: collapse; }
+        table.bench th {
+            text-align: left; padding: 10px 12px; font-size: 12px;
+            color: #94a3b8; border-bottom: 1px solid #334155; background: #0f172a;
+        }
+        table.bench td { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #1e293b; }
+    </style>
+</head>
+<body>
+    {%app_entry%}
+    <footer>{%config%}{%scripts%}{%renderer%}</footer>
+</body>
+</html>"""
+
+TAB_STYLE = {
+    "backgroundColor": "#111827", "color": "#94a3b8", "border": "1px solid #1e293b",
+    "padding": "10px 16px", "fontWeight": "600", "fontSize": "13px",
+}
+TAB_SELECTED = {
+    "backgroundColor": "#1e293b", "color": "#38bdf8", "borderTop": "3px solid #38bdf8",
+    "borderLeft": "1px solid #1e293b", "borderRight": "1px solid #1e293b", "borderBottom": "none",
+    "padding": "10px 16px", "fontWeight": "700", "fontSize": "13px",
+}
+
+app.layout = html.Div(
+    style={"maxWidth": "1440px", "margin": "0 auto", "padding": "18px"},
+    children=[
+        # Live tick starts DISABLED until user uploads their real dataset
+        dcc.Interval(id="live-tick", interval=1000, n_intervals=40, disabled=True),
+
+        # Persistent Header
+        html.Div(
+            style={
+                "background": "linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%)",
+                "border": "1px solid #1e40af",
+                "borderRadius": "14px",
+                "padding": "16px 22px",
+                "marginBottom": "16px",
+                "display": "flex",
+                "justifyContent": "space-between",
+                "alignItems": "center",
+                "flexWrap": "wrap",
+                "gap": "12px",
+            },
+            children=[
+                html.Div([
+                    html.Div("LOCAL PRIVACY-FIRST CLINICAL TELEMETRY", style={"fontSize": "10.5px", "fontWeight": "700", "letterSpacing": "1.2px", "color": "#93c5fd"}),
+                    html.H1("12-Agent Autonomous Stress Monitoring Dashboard", style={"margin": "3px 0 0 0", "fontSize": "21px", "fontWeight": "800", "color": "#ffffff"}),
+                ]),
+                html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"}, children=[
+                    dcc.Upload(
+                        id="upload-header",
+                        children=html.Button("Upload CSV / Excel", className="btn-primary"),
+                        multiple=False,
+                    ),
+                    html.Span(id="upload-status", children="Waiting for your dataset...", style={"fontSize": "12px", "color": "#bfdbfe", "fontWeight": "600"}),
+                ]),
+            ],
+        ),
+
+        # Error Banner (if invalid file)
+        html.Div(id="error-banner", style={"marginBottom": "12px"}),
+
+        # Center-Stage Upload Gate (Visible before dataset upload, hidden after upload)
+        html.Div(
+            id="upload-gate",
+            style={"maxWidth": "740px", "margin": "48px auto"},
+            children=[
+                html.Div(className="card", style={"padding": "34px", "textAlign": "center"}, children=[
+                    html.Div("READY FOR CLINICAL DATASET", style={"fontSize": "11.5px", "fontWeight": "800", "letterSpacing": "1.3px", "color": "#38bdf8", "marginBottom": "8px"}),
+                    html.H2("Upload Your Stress Dataset to Launch All 12 Agents", style={"margin": "0 0 10px 0", "fontSize": "22px", "color": "#f8fafc"}),
+                    html.P(
+                        "No demo data is pre-loaded. Drop your CSV or Excel (.xlsx) file below — the system will automatically map biomarkers, train parallel ML ensembles, start live patient telemetry, and unlock 3-page PDF dossier exports.",
+                        style={"fontSize": "13.5px", "color": "#94a3b8", "lineHeight": "1.6", "marginBottom": "22px"},
+                    ),
+                    dcc.Upload(
+                        id="upload-main",
+                        children=html.Div([
+                            html.Div("Drop CSV / XLSX File Here", style={"fontSize": "16px", "fontWeight": "700", "color": "#f8fafc", "marginBottom": "6px"}),
+                            html.Div("or click to browse from your computer", style={"fontSize": "13px", "color": "#93c5fd"}),
+                        ]),
+                        style={
+                            "padding": "38px 20px",
+                            "borderWidth": "2px",
+                            "borderStyle": "dashed",
+                            "borderColor": "#3b82f6",
+                            "borderRadius": "12px",
+                            "background": "rgba(37, 99, 235, 0.08)",
+                            "cursor": "pointer",
+                            "marginBottom": "18px",
+                        },
+                        multiple=False,
+                    ),
+                    html.Div(
+                        "Auto-detected columns: Participant_ID, HR, Stroop_HR, Interview_HR, Hypervent_HR, RR, Stress_RR, EDA, Temp, Age, Gender, PSS, STAI_State, STAI_Trait, Label",
+                        style={"fontSize": "11.5px", "color": "#64748b"},
+                    ),
+                ])
+            ],
+        ),
+
+        # Full Dashboard Workspace (Hidden until dataset is uploaded)
+        html.Div(
+            id="dashboard-workspace",
+            style={"display": "none"},
+            children=[
+                html.Div(id="kpi-container"),
+
+                html.Div(
+                    className="workspace-grid",
+                    children=[
+                        # LEFT SIDEBAR: LIVE PATIENT MONITOR
+                        html.Div(
+                            className="card",
+                            style={"position": "sticky", "top": "14px"},
+                            children=[
+                                html.Div(style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "10px"}, children=[
+                                    html.Span("LIVE PATIENT MONITOR", style={"fontSize": "11.5px", "fontWeight": "800", "letterSpacing": "0.8px", "color": "#38bdf8"}),
+                                    html.Button("Pause", id="btn-live-toggle", n_clicks=0, className="btn-muted", style={"padding": "4px 10px", "fontSize": "11px"}),
+                                ]),
+                                html.Div(
+                                    className="dropdown-wrap",
+                                    style={"marginBottom": "10px"},
+                                    children=[dcc.Dropdown(id="participant-dropdown", options=[], value=None, clearable=False)],
+                                ),
+                                html.Div(
+                                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1.4fr", "gap": "6px", "marginBottom": "12px"},
+                                    children=[
+                                        html.Button("◀ Prev", id="btn-prev-pt", n_clicks=0, className="btn-muted"),
+                                        html.Button("Next ▶", id="btn-next-pt", n_clicks=0, className="btn-muted"),
+                                        html.Button("Highest Risk", id="btn-high-pt", n_clicks=0, className="btn-danger"),
+                                    ],
+                                ),
+                                html.Div(id="left-live-vitals", style={"marginBottom": "10px"}),
+                                html.Div(id="left-patient-card"),
+                                html.Div(style={"marginTop": "12px"}, children=[
+                                    html.Button("Export 3-Page Clinical PDF", id="btn-pdf", n_clicks=0, className="btn-success"),
+                                    dcc.Download(id="download-pdf"),
+                                ]),
+                            ],
+                        ),
+
+                        # RIGHT WORKSPACE: CHARTS, SIMULATOR, COHORT & PIPELINE
+                        html.Div([
+                            dcc.Tabs(
+                                id="main-tabs",
+                                value="tab-patient",
+                                style={"marginBottom": "14px"},
+                                children=[
+                                    dcc.Tab(
+                                        label="Live Telemetry & Diagnostics",
+                                        value="tab-patient",
+                                        style=TAB_STYLE,
+                                        selected_style=TAB_SELECTED,
+                                        children=html.Div(style={"marginTop": "14px"}, children=[
+                                            html.Div(className="card", style={"marginBottom": "14px"}, children=[
+                                                dcc.Graph(id="live-telemetry-graph", config={"displayModeBar": False}),
+                                            ]),
+                                            html.Div(id="right-patient-panel"),
+                                        ]),
+                                    ),
+                                    dcc.Tab(
+                                        label="What-If Stress Simulator",
+                                        value="tab-sim",
+                 
