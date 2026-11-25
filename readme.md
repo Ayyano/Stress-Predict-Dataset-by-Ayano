@@ -301,4 +301,4 @@ If you reference the original Empatica E4 stress protocol or pair this synthetic
 
 Released under the **MIT License** · Free to use, modify, and redistribute with attribution and retention of the synthetic data disclaimer.
 
-&lt;/div&gt;
+&lt;&gt;
