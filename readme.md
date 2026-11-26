@@ -1,140 +1,193 @@
-# Stress Prediction: Synthetic Dataset & ML Research Pipeline
+<div align="center">
 
-> A student-friendly research project for exploring stress-label classification from wearable-style signals and self-reported measures. It uses clear diagrams, interactive charts, and concise explanations so you can follow—and present—each step of the workflow.
+# Stress Prediction Lab
 
-**Important:** The included dataset is synthetic. This repository is for learning and experimentation, not medical use. Model scores on generated data do not establish clinical accuracy or real-world performance.
+### A visual, student-friendly tour of synthetic stress classification
 
-## Start here
+[![Open in Colab](https://img.shields.io/badge/OPEN%20IN-COLAB-F9AB00?style=for-the-badge&logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/Ayyano/Stress-Predict-Dataset-by-Ayano/blob/main/finally.ipynb)
+[![Jupyter Notebook](https://img.shields.io/badge/NOTEBOOK-JUPYTER-F37626?style=for-the-badge&logo=jupyter&logoColor=white)](./finally.ipynb)
+![Synthetic data](https://img.shields.io/badge/DATA-600%20SYNTHETIC%20ROWS-0F766E?style=for-the-badge)
+![Learning project](https://img.shields.io/badge/PURPOSE-EDUCATION-4F46E5?style=for-the-badge)
 
-| If you want to… | Open… |
-|---|---|
-| Understand and reproduce the research workflow | [`finally.ipynb`](./finally.ipynb) |
-| Inspect the ready-to-use 600-row dataset | [`synthetic_stress_predict_600_participants.csv`](./synthetic_stress_predict_600_participants.csv) |
-| Explore the bundled raw-data archive | [`synthetic_stress_predict_raw_data_S001_S600.zip`](./synthetic_stress_predict_raw_data_S001_S600.zip) |
-| Review supplementary dashboard and clinical-report code | [`live preview and download clinical pdfs reports`](./live%20preview%20and%20download%20clinical%20pdfs%20reports) |
+<br />
 
-## Project at a glance
+<a href="./finally.ipynb"><img src="./assets/stress-project-banner.svg" alt="Stress Prediction Lab: signals to baseline deltas to model evaluation" width="100%" /></a>
 
-- **Task:** Binary classification of a synthetic stress label (`0` = Normal/Baseline, `1` = Stressed).
-- **Dataset:** 600 records and 17 columns, including physiological measurements, questionnaire scores, demographics, and metadata.
-- **Main idea:** Compare resting HR/RR baselines with task measurements, then evaluate whether baseline-relative features help separate the two labels.
-- **Research workflow:** Data checks → feature engineering → model evaluation → visual comparison → report generation.
-- **Learning level:** Suitable for students who know basic Python and want to study a full tabular-ML project.
+**Understand the full journey:** data → features → models → evidence → explanation.
 
-## How the workflow fits together
+</div>
+
+> [!IMPORTANT]
+> **Educational use only.** The included data is synthetic—not collected from real people. This project is not a medical device or diagnostic tool, and its model scores are not evidence of clinical performance.
+
+## ✨ Explore the project
+
+| 01 · Learn | 02 · Explore | 03 · Reproduce |
+|---|---|---|
+| [Research notebook](./finally.ipynb) | [600-row dataset](./synthetic_stress_predict_600_participants.csv) | [Open in Google Colab](https://colab.research.google.com/github/Ayyano/Stress-Predict-Dataset-by-Ayano/blob/main/finally.ipynb) |
+| Step-by-step analysis, visualizations, and model comparisons | 17 columns of synthetic participant records | Run the notebook without a local setup |
+
+**Also in the repository:** [Raw-data archive](./synthetic_stress_predict_raw_data_S001_S600.zip) · [Supplementary dashboard/report source](./live%20preview%20and%20download%20clinical%20pdfs%20reports)
+
+## 🧭 The research journey
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#ecfeff","primaryTextColor":"#0f172a","primaryBorderColor":"#0f766e","lineColor":"#64748b","secondaryColor":"#eff6ff","tertiaryColor":"#f5f3ff","fontFamily":"ui-sans-serif, system-ui, sans-serif"}}}%%
 flowchart LR
-    A[CSV: 600 synthetic records] --> B[Inspect columns and labels]
-    B --> C[Clean values and audit missingness / outliers]
-    C --> D[Create baseline-relative features]
-    D --> E[Split data and run stratified validation]
-    E --> F[Compare and tune classifiers]
-    F --> G[Review metrics, plots, and cohort checks]
-    G --> H[Export tables, figures, and reports]
+    A["📥 01 · Load<br/>600 synthetic rows"] --> B["🔎 02 · Inspect<br/>labels & quality"]
+    B --> C["🧹 03 · Prepare<br/>missingness & outliers"]
+    C --> D["🧮 04 · Engineer<br/>baseline-relative Δ"]
+    D --> E["🧪 05 · Validate<br/>stratified splits & CV"]
+    E --> F["🌲 06 · Compare<br/>models & ensembles"]
+    F --> G["📊 07 · Explain<br/>metrics & figures"]
+    G --> H["📄 08 · Share<br/>tables & reports"]
+    classDef data fill:#ecfeff,stroke:#0f766e,color:#134e4a,stroke-width:2px
+    classDef model fill:#eff6ff,stroke:#2563eb,color:#1e3a8a,stroke-width:2px
+    classDef explain fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95,stroke-width:2px
+    class A,B,C data
+    class D,E,F model
+    class G,H explain
 ```
 
-### In plain language
+<details>
+<summary><strong>💡 What happens at each step?</strong></summary>
+<br />
 
-1. **Load and inspect:** Read the CSV, identify the target and measurements, and check data quality.
-2. **Prepare features:** Compare task responses with resting measurements. For example, `ΔInterview HR = Interview HR − Resting HR`.
-3. **Train fairly:** Use stratified train/test splits and cross-validation so class proportions are maintained across folds.
-4. **Compare models:** The notebook evaluates several classifiers and includes tuned models and ensemble comparisons.
-5. **Explain results:** Review accuracy, precision, recall, F1, ROC-AUC, confusion matrices, feature importance, and ablation results—not accuracy alone.
-6. **Create visuals and reports:** Generate research figures and report-oriented outputs to help explain the analysis.
+1. **Load & inspect** — Find the target and signals; examine labels and data quality.
+2. **Prepare** — Handle missing values and review outliers before modeling.
+3. **Engineer** — Express task response relative to resting measurements.
+4. **Validate** — Use stratified train/test splits and cross-validation.
+5. **Compare** — Evaluate several classifiers, tuned models, and ensembles.
+6. **Explain** — Compare metrics, error patterns, feature importance, and ablations.
+7. **Share** — Review the generated figures, result tables, and report outputs.
 
-## Dataset guide
+</details>
 
-The main CSV has **600 rows × 17 columns**. Each row represents one synthetic participant record. The values are generated for demonstration; they are not measurements collected from real people.
+## 📡 Dataset at a glance
+
+<div align="center">
+
+| **600** records | **17** columns | **2** target classes | **Synthetic** data |
+|:---:|:---:|:---:|:---:|
+| One record per generated participant | Biomarkers, scores & metadata | `0` baseline · `1` stressed | For study and demonstration |
+
+</div>
+
+<details>
+<summary><strong>🗂️ Open the data dictionary</strong></summary>
+<br />
 
 | Column | Meaning |
 |---|---|
-| `Participant_ID` | Synthetic participant identifier |
+| `Participant_ID` | Generated participant identifier |
 | `Assigned Name` | Generated name/group label; not a real identity |
-| `Age` | Age value in the generated record |
-| `Gender` | Generated gender category |
+| `Age`, `Gender` | Demographic fields in the synthetic record |
 | `PSS Score (0-40)` | Perceived Stress Scale-style score |
 | `STAI-State (20-80)` | State anxiety-style score |
 | `STAI-Trait (20-80)` | Trait anxiety-style score |
-| `HR` | Resting heart rate, beats per minute (bpm) |
+| `HR` | Resting heart rate (beats per minute) |
 | `Stroop HR (bpm)` | Heart rate during the Stroop task |
 | `Interview HR (bpm)` | Heart rate during the interview task |
 | `Hyperventilation HR (bpm)` | Heart rate during the hyperventilation task |
 | `RR` | Resting respiratory rate |
-| `Stress Resp Rate (brpm)` | Respiratory rate during a stress/task condition |
+| `Stress Resp Rate (brpm)` | Respiratory rate during a task condition |
 | `Mean EDA (μS)` | Mean electrodermal activity (microsiemens) |
 | `Skin Temp (°C)` | Skin temperature in degrees Celsius |
-| `Label` | Binary target: `0` baseline/normal, `1` stressed |
-| `Time` | Synthetic timestamp metadata |
+| `Label` | Binary target: `0` = baseline/normal, `1` = stressed |
+| `Time` | Generated timestamp metadata |
 
-**Beginner tip:** IDs, generated names, and timestamps are descriptive fields, not physiological signals. Before training, check which columns the notebook actually selects as model features; never assume every CSV column should be an input.
+**Student note:** IDs, names, and timestamps are metadata, not physiological signals. Check the notebook's selected features before training; never assume every column belongs in the model.
 
-### Baseline-relative features
+</details>
 
-A baseline-relative feature describes **how much a signal changes from a person's own resting value**. Examples used by the notebook include:
+## 🧠 The key idea · compare change, not just level
 
-| Feature | Example calculation | Why it can help |
-|---|---|---|
-| Task heart-rate change | `Task HR − Resting HR` | Focuses on reactivity, not just a person's resting level |
-| Respiratory-rate change | `Task RR − Resting RR` | Captures task-related breathing change |
-| Percent change | `Change ÷ Resting value` | Puts changes into context of the baseline |
-| Questionnaire differences | State score − trait score | Compares current state with a longer-term tendency |
+A baseline-relative feature asks: **“How did this signal change from rest?”**
 
-These are feature-engineering choices for a learning experiment, not validated clinical indicators.
+<div align="center">
 
-## Models and evaluation
+| Resting value | Task value | Baseline-relative feature |
+|:---:|:---:|:---:|
+| Resting HR | Interview HR | **ΔInterview HR = Interview HR − Resting HR** |
+| Resting RR | Task respiratory rate | **ΔRR = Task RR − Resting RR** |
 
-The notebook is designed as a comparative study rather than a single-model demo. It includes baseline-only and engineered-feature tracks, stratified validation, multiple classifiers, hyperparameter search, and ensemble comparisons. Exact outputs depend on the notebook version, installed package versions, and the data used.
+</div>
 
-**Metrics in the notebook**
+This reframes the model input around **individual change** rather than only the absolute measurement. It is an educational feature-engineering idea—not a validated clinical indicator.
 
-- **Accuracy:** Share of all predictions that are correct.
-- **Precision:** Of records predicted stressed, how many are labeled stressed?
-- **Recall:** Of records labeled stressed, how many did the model find?
-- **F1 score:** A combined precision/recall score.
-- **ROC-AUC:** How well scores rank positive versus negative examples across thresholds.
-- **Confusion matrix:** Counts of correct and incorrect predictions for each class.
+## 📈 Models & evidence
 
-> Do not treat a high score on this synthetic dataset as proof that a model can detect stress in people. Generated labels and features can have simple relationships that real, noisy data does not. A real study needs appropriate consent, validated measurements, independent participants, careful leakage checks, and clinical oversight.
+The notebook compares raw-baseline and engineered-feature tracks, then evaluates classifiers and ensemble approaches. Results are presented with multiple views so one number does not tell the whole story.
 
-## Run the notebook
+| Metric | The question it answers |
+|---|---|
+| **Accuracy** | What fraction of predictions were correct? |
+| **Precision** | Of records predicted stressed, how many were labeled stressed? |
+| **Recall** | Of stressed-labeled records, how many did the model find? |
+| **F1** | How do precision and recall balance together? |
+| **ROC-AUC** | How well are the two classes ranked across thresholds? |
+| **Confusion matrix** | Which kinds of predictions were correct or incorrect? |
 
-### Option A — Google Colab
+**Notebook views include:** stratified cross-validation · 70/30 and 80/20 comparisons · feature ablation · feature importance · ROC curves · confusion matrices · cohort-level checks.
 
-1. Open [`finally.ipynb`](./finally.ipynb) in GitHub and choose **Open in Colab** (or upload the notebook to Colab).
-2. Make sure the project CSV is available in the runtime. The notebook searches for a local CSV and contains a fallback synthetic-data generator.
-3. Run the notebook from top to bottom. Some model searches may take several minutes.
-4. Review the printed tables and figures, then open the generated output folder (`/content/results` in Colab; `./results` in a local run).
+> **Interpret results carefully.** Synthetic labels and features can have simple relationships that real-world data does not. High benchmark scores here do not show that a model can detect stress in people. Real research requires validated measures, independent participants, leakage checks, consent, and appropriate oversight.
 
-### Option B — Local Jupyter environment
+## 🚀 Run it
 
-From the repository folder, install the libraries used across the notebook's ML, visualization, and report sections, then launch Jupyter:
+### Fastest route · Google Colab
+
+1. Open [`finally.ipynb`](./finally.ipynb) in Colab using the button above.
+2. Confirm the project CSV is available in the runtime. The notebook searches for a local CSV and includes a synthetic-data fallback.
+3. Run cells from top to bottom; model searches may take several minutes.
+4. Review the charts and tables in the notebook. Outputs are saved under `/content/results` in Colab.
+
+### Local Jupyter
 
 ```bash
-python -m pip install numpy pandas matplotlib seaborn scipy scikit-learn xgboost lightgbm reportlab dash plotly openpyxl
-python -m pip install jupyter
+python -m pip install numpy pandas matplotlib seaborn scipy scikit-learn xgboost lightgbm reportlab dash plotly openpyxl jupyter
 jupyter notebook finally.ipynb
 ```
 
-Run cells in order. The notebook writes analysis outputs to `./results` when `/content` is not present. If optional report or dashboard sections require extra environment setup, follow the notes shown in those cells.
+Run the cells in order. Outside Colab, the notebook uses `./results` for generated outputs. Some optional report/dashboard sections may need additional environment setup described in their notebook cells.
 
-## What the notebook produces
+## 🎨 What you can present
 
-Depending on which cells you run, the notebook saves result tables and visualizations under its results directory. Examples include:
+| Visual / output | Use it to explain… |
+|---|---|
+| Workflow diagram | The sequence from data checks to evaluation |
+| Feature-space and cohort plots | How engineered signals compare across labels/groups |
+| Ablation and feature-importance charts | Whether feature groups affect model results |
+| ROC curve and confusion matrix | Ranking quality and prediction errors |
+| Result tables and PDF outputs | The findings in a presentation-friendly format |
 
-- Model comparisons for the 70/30 and 80/20 splits.
-- 5-, 7-, and 10-fold cross-validation summaries.
-- Feature-ablation and hyperparameter-tuning summaries.
-- Cohort-level evaluation tables.
-- Workflow, feature-space, cohort, feature-importance, ROC, and confusion-matrix figures.
-- Supplementary dashboard and PDF-report outputs from the later notebook sections.
+Exact output names and scores may change with the notebook version, data, and package versions. Use the generated notebook outputs as the source of truth.
 
-Use the notebook output as the source of truth for exact filenames and scores, as generated artifacts may change when the code or environment changes.
+<details>
+<summary><strong>🗣️ Student presentation cheat sheet</strong></summary>
+<br />
 
-## Repository map
+1. **Question:** Can baseline-relative signals help classify this synthetic label?
+2. **Data:** What does one row represent? Why is the dataset synthetic?
+3. **Method:** How were features created, and how was validation performed?
+4. **Evidence:** What do precision, recall, and the confusion matrix add beyond accuracy?
+5. **Limitations:** What could make synthetic-data results fail to generalize?
+6. **Next step:** What independent, ethically collected data would test the idea?
+
+</details>
+
+## 🧪 Reproducibility checklist
+
+- Record the notebook version, dataset file, package versions, split strategy, and metrics.
+- Keep test data out of model selection; do not tune against the final test results.
+- Check whether any input feature is derived from, or directly encodes, the target.
+- Treat every generated score as an experiment result, not a clinical claim.
+
+## 📁 Repository map
 
 ```text
 .
+├── assets/
+│   └── stress-project-banner.svg
 ├── finally.ipynb
 ├── readme.md
 ├── synthetic_stress_predict_600_participants.csv
@@ -142,22 +195,10 @@ Use the notebook output as the source of truth for exact filenames and scores, a
 └── live preview and download clinical pdfs reports
 ```
 
-## Suggested student presentation outline
+<div align="center">
 
-1. **Research question:** Can baseline-relative physiological features help classify the synthetic stress label?
-2. **Data:** Explain what one row represents, what the target means, and why the data is synthetic.
-3. **Method:** Walk through cleaning, baseline-delta features, splitting, and cross-validation.
-4. **Comparison:** Show at least one baseline-versus-engineered-feature comparison and discuss precision/recall alongside accuracy.
-5. **Limitations:** Discuss synthetic data, possible feature/label shortcuts, generalization, and why this is not a clinical tool.
-6. **Next step:** Test a clearly defined hypothesis on an appropriate, ethically collected, independent dataset.
+**Built for learning, visual explanation, and reproducible exploration.**
 
-## Reproducibility notes
+[⬆ Back to top](#stress-prediction-lab)
 
-- The notebook uses a fixed random seed in its main research workflow, but library versions and runtime details can still affect results.
-- Record the notebook version, data file, package versions, split strategy, and metrics when presenting results.
-- Keep an untouched test set separate from choices made during model selection; do not use test results to tune the model.
-- Check whether any feature is derived from, or directly encodes, the target before interpreting model performance.
-
-## Disclaimer
-
-This project is educational and research-oriented. It is not a medical device, diagnostic tool, or substitute for professional advice. Do not use its predictions to make decisions about a person's health or care.
+</div>
